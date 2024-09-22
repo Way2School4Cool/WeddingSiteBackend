@@ -1,115 +1,110 @@
 package main
 
 import (
+    "bytes"
+    "context"
+    "encoding/base64"
 	"fmt"
-    "io"
-	"net/http"
-	"os"
-	"path/filepath"
+    "os"
     "time"
+    "github.com/aws/aws-lambda-go/events"
+    "github.com/aws/aws-lambda-go/lambda"
+    "github.com/aws/aws-sdk-go/aws"
+    "github.com/aws/aws-sdk-go/aws/session"
+    "github.com/aws/aws-sdk-go/service/s3"
 )
 
-const uploadPath = "./uploads"
+var s3Client *s3.S3
+var bucketName = os.Getenv("kc-wedding-image-bucket-storage")
+
+func init() {
+    sess := session.Must(session.NewSession())
+    s3Client = s3.New(sess)
+}
 
 // uploadHandler handles the file upload
-func uploadHandler(response http.ResponseWriter, request *http.Request) {
-    start := time.Now()
-    var checkpoint time.Time
+func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+    imageBase64 := request.Body
 
-    // Set CORS headers
-    response.Header().Set("Access-Control-Allow-Origin", "*")  // Allow all origins; for production, specify the allowed domain
-    response.Header().Set("Access-Control-Allow-Methods", "POST")
-    response.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
-    if request.Method == http.MethodOptions {
-        response.WriteHeader(http.StatusOK)  // Handle preflight requests
-        return
-    }
-
-    // Parse the multipart form
-    err := request.ParseMultipartForm(32 << 20)
+    // Decode the base64 image
+    imageData, err := base64.StdEncoding.DecodeString(imageBase64)
     if err != nil {
-        http.Error(response, "Could not parse form", http.StatusBadRequest)
-        return
+        return events.APIGatewayProxyResponse{StatusCode: 400, Body: fmt.Sprintf("Error decoding image: %s", err)}, nil
     }
 
-    if request.Method == http.MethodPost {
-        file, header, err := request.FormFile("image")
-            if err != nil {
-            http.Error(response, "Error retrieving the file", http.StatusBadRequest)
-            return
-        }
-		defer file.Close()
 
-        // Limit file size to 100MB
-        if header.Size > 100*1024*1024 {
-            http.Error(response, "file is too large", http.StatusBadRequest)
-            return
-        }
+    // Limit file size to 100MB
+    if len(imageData) > 100*1024*1024 {
+        return events.APIGatewayProxyResponse{StatusCode: 400, Body: "File is too large"}, nil
+    }
 
-        // Restrict file types to images only
-        allowedTypes := map[string]bool{
-            "image/gif": true,
-            "image/heif": true,
-            "image/jpeg": true,
-            "image/raw": true,
-            "image/png":  true,
-            "image/webp": true,
-        }
+    fileType := request.Headers["Content-Type"]
+    if fileType == "" {
+        return events.APIGatewayProxyResponse{StatusCode: 400, Body: "Content-Type header is missing"}, nil
+    }
 
-        fileType := header.Header.Get("Content-Type")
-        if !allowedTypes[fileType] {
-            http.Error(response, "invalid file type", http.StatusBadRequest)
-            return
-        }
-            
-		// Create the uploads directory if it doesn't exist
-		if _, err := os.Stat(uploadPath); os.IsNotExist(err) {
-			err := os.Mkdir(uploadPath, os.ModePerm)
-			if err != nil {
-				http.Error(response, "Unable to create upload directory\n", http.StatusInternalServerError)
-				return
-			}
-		}
+    // Restrict file types to images only
+    allowedTypes := map[string]bool{
+        "image/gif": true,
+        "image/heif": true,
+        "image/jpeg": true,
+        "image/png":  true,
+        "image/webp": true,
+    }
 
-        // TODO: Hash images to prevent repeats
+    if !allowedTypes[fileType] {
+        return events.APIGatewayProxyResponse{StatusCode: 400, Body: "Invalid file type"}, nil
+    }
+
+    // TODO: Hash images to prevent repeats
+    
         
-        
-        // TODO: Compress files
+    // TODO: Compress files
 
 
-		
-        // Create a file in the uploads directory
-		destFile, err := os.Create(filepath.Join(uploadPath, time.Now().String()))
-		if err != nil {
-			http.Error(response, "Unable to create file\n", http.StatusInternalServerError)
-			return
-		}
-		defer destFile.Close()
+    // TODO: Reformat images to webp for size
 
-        // TODO: Reformat images to webp for size
+    // Create a unique file name using the input file type
+    fileExtension := GetExtension(fileType)
+    fileName := fmt.Sprintf("image_%d%s", time.Now().Unix(), fileExtension)
 
-		// Copy the uploaded file to the destination file
-		_, err = io.Copy(destFile, file)
-		if err != nil {
-			http.Error(response, "Unable to save file\n", http.StatusInternalServerError)
-			return
-		}
+    // Upload to S3
+    _, err = s3Client.PutObject(&s3.PutObjectInput{
+        Bucket: aws.String(bucketName),
+        Key:    aws.String(fileName),
+        Body:   aws.ReadSeekCloser(bytes.NewReader(imageData)),
+        ContentType: aws.String("image/jpeg"),
+    })
+    
+    if err != nil {
+        return events.APIGatewayProxyResponse{StatusCode: 500, Body: fmt.Sprintf("Failed to upload image: %s", err)}, nil
+    }
+    
+    return events.APIGatewayProxyResponse{
+        StatusCode: 200,
+        Body:       fmt.Sprintf("Image uploaded successfully: %s", fileName),
+    }, nil
+}
 
-		fmt.Fprintf(response, "File successfully uploaded\n")
-	} else {
-		http.Error(response, "Invalid request method\n", http.StatusMethodNotAllowed)
-	}
-
-    checkpoint = time.Now()
-    fmt.Printf("Saved to file @ %s\n\tSaved in: %v\n", time.Now().String(), checkpoint.Sub(start));
+// GetExtension maps MIME types to file extensions
+func GetExtension(fileType string) string {
+    switch fileType {
+    case "image/gif":
+        return ".gif"
+    case "image/heif":
+        return ".heif"
+    case "image/jpeg":
+        return ".jpg"
+    case "image/png":
+        return ".png"
+    case "image/webp":
+        return ".webp"
+    default:
+        return ".jpg" // Fallback if type is unknown
+    }
 }
 
 func main() {
-	http.HandleFunc("/uploadimage", uploadHandler)
-	fmt.Println("Server started at http://localhost:8085")
-	if err := http.ListenAndServe(":8085", nil); err != nil {
-		fmt.Println("Server failed:", err)
-	}
+    lambda.Start(handler)
 }
 
